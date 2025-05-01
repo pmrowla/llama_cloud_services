@@ -25,9 +25,11 @@ from llama_cloud_services.parse.utils import (
     ResultType,
     ParsingMode,
     FailedPageMode,
+    expand_target_pages,
     nest_asyncio_err,
     nest_asyncio_msg,
     make_api_request,
+    partition_pages,
 )
 
 # can put in a path to the file or the file bytes itself
@@ -453,6 +455,11 @@ class LlamaParse(BasePydanticReader):
         description="Whether to use the vendor multimodal API.",
     )
 
+    partition_pages: Optional[int] = Field(
+        default=None,
+        description="If set, documents will automatically be partitioned into segments containing the specified number of pages at most. Parsing will be split into separate jobs for each partition segment. Can be used in combination with targetPages and maxPages.",
+    )
+
     @field_validator("api_key", mode="before", check_fields=True)
     @classmethod
     def validate_api_key(cls, v: str) -> str:
@@ -540,6 +547,7 @@ class LlamaParse(BasePydanticReader):
         file_input: FileInput,
         extra_info: Optional[dict] = None,
         fs: Optional[AbstractFileSystem] = None,
+        partition_target_pages: Optional[str] = None,
     ) -> str:
         files = None
         file_handle = None
@@ -834,7 +842,9 @@ class LlamaParse(BasePydanticReader):
         if self.take_screenshot:
             data["take_screenshot"] = self.take_screenshot
 
-        if self.target_pages is not None:
+        if partition_target_pages is not None:
+            data["target_pages"] = partition_target_pages
+        elif self.target_pages is not None:
             data["target_pages"] = self.target_pages
         if self.user_prompt is not None:
             data["user_prompt"] = self.user_prompt
@@ -965,9 +975,39 @@ class LlamaParse(BasePydanticReader):
         extra_info: Optional[dict] = None,
         fs: Optional[AbstractFileSystem] = None,
         result_type: Optional[str] = None,
+        num_workers: Optional[int] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        if self.partition_pages is None:
+            job_results = [
+                await self._parse_one_unpartitioned(
+                    file_path,
+                    extra_info=extra_info,
+                    fs=fs,
+                    result_type=result_type,
+                )
+            ]
+        else:
+            job_results = await self._parse_one_partitioned(
+                file_path,
+                extra_info,
+                fs=fs,
+                result_type=result_type,
+                num_workers=num_workers,
+            )
+        return job_results
+
+    async def _parse_one_unpartitioned(
+        self,
+        file_path: FileInput,
+        extra_info: Optional[dict] = None,
+        fs: Optional[AbstractFileSystem] = None,
+        result_type: Optional[str] = None,
+        **create_kwargs: Any,
     ) -> Tuple[str, Dict[str, Any]]:
         """Create one parse job and wait for the result."""
-        job_id = await self._create_job(file_path, extra_info=extra_info, fs=fs)
+        job_id = await self._create_job(
+            file_path, extra_info=extra_info, fs=fs, **create_kwargs
+        )
         if self.verbose:
             print("Started parsing the file under job_id %s" % job_id)
         result = await self._get_job_result(
@@ -975,21 +1015,105 @@ class LlamaParse(BasePydanticReader):
         )
         return job_id, result
 
+    async def _parse_one_partitioned(
+        self,
+        file_path: FileInput,
+        extra_info: Optional[dict] = None,
+        fs: Optional[AbstractFileSystem] = None,
+        result_type: Optional[str] = None,
+        num_workers: Optional[int] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Partition a file and run separate parse jobs per partition segment."""
+        assert self.partition_pages is not None
+
+        num_workers = num_workers or self.num_workers
+        if num_workers < 1:
+            raise ValueError("Invalid number of workers")
+        if self.target_pages is not None:
+            jobs = [
+                self._parse_one_unpartitioned(
+                    file_path,
+                    extra_info=extra_info,
+                    fs=fs,
+                    result_type=result_type,
+                    partition_target_pages=target_pages,
+                )
+                for target_pages in partition_pages(
+                    expand_target_pages(self.target_pages),
+                    self.partition_pages,
+                    max_pages=self.max_pages,
+                )
+            ]
+            return await run_jobs(
+                jobs,
+                workers=num_workers,
+                desc="Getting job results",
+                show_progress=self.show_progress,
+            )
+
+        total = 0
+        results: List[Tuple[str, Dict[str, Any]]] = []
+        while self.max_pages is None or total < self.max_pages:
+            if (
+                self.max_pages is not None
+                and total + self.partition_pages >= self.max_pages
+            ):
+                size = self.max_pages - total
+            else:
+                size = self.partition_pages
+            if not size:
+                break
+            try:
+                # Fetch JSON result type first to get accurate pagination data
+                # and then fetch the user's desired result type if needed
+                job_id, json_result = await self._parse_one_unpartitioned(
+                    file_path,
+                    extra_info=extra_info,
+                    fs=fs,
+                    result_type=ResultType.JSON.value,
+                    partition_target_pages=f"{total}-{total + size - 1}",
+                )
+                result_type = result_type or self.result_type.value
+                if result_type == ResultType.JSON.value:
+                    job_result = json_result
+                else:
+                    job_result = await self._get_job_result(
+                        job_id, result_type, verbose=self.verbose
+                    )
+            except Exception:
+                if results:
+                    # API Error is expected if we try to read past the end of the file
+                    return results
+                raise
+            results.append((job_id, job_result))
+            if len(json_result["pages"]) < size:
+                break
+            total += size
+        return results
+
     async def _aload_data(
         self,
         file_path: FileInput,
         extra_info: Optional[dict] = None,
         fs: Optional[AbstractFileSystem] = None,
         verbose: bool = False,
+        num_workers: Optional[int] = None,
     ) -> List[Document]:
         """Load data from the input path."""
         try:
-            _job_id, result = await self._parse_one(
-                file_path, extra_info=extra_info, fs=fs
-            )
+            results = [
+                job_result
+                for _, job_result in await self._parse_one(
+                    file_path, extra_info, fs=fs, num_workers=num_workers
+                )
+            ]
+            # Flatten the resulting doc if it was partitioned
+            separator = self.page_separator or _DEFAULT_SEPARATOR
             docs = [
                 Document(
-                    text=result[self.result_type.value],
+                    text=separator.join(
+                        result[self.result_type.value] for result in results
+                    ),
                     metadata=extra_info or {},
                 )
             ]
@@ -1012,7 +1136,11 @@ class LlamaParse(BasePydanticReader):
         extra_info: Optional[dict] = None,
         fs: Optional[AbstractFileSystem] = None,
     ) -> List[Document]:
-        """Load data from the input path."""
+        """Load data from the input path.
+
+        File(s) which were partitioned before parsing will be loaded as a single
+        re-assembled Document.
+        """
         if isinstance(file_path, (str, PurePosixPath, Path, bytes, BufferedIOBase)):
             return await self._aload_data(
                 file_path, extra_info=extra_info, fs=fs, verbose=self.verbose
@@ -1024,6 +1152,7 @@ class LlamaParse(BasePydanticReader):
                     extra_info=extra_info,
                     fs=fs,
                     verbose=self.verbose and not self.show_progress,
+                    num_workers=1,
                 )
                 for f in file_path
             ]
@@ -1062,6 +1191,34 @@ class LlamaParse(BasePydanticReader):
             else:
                 raise e
 
+    async def _aparse_one(
+        self,
+        file_path: FileInput,
+        file_name: str,
+        extra_info: Optional[dict] = None,
+        fs: Optional[AbstractFileSystem] = None,
+        num_workers: Optional[int] = None,
+    ) -> List[JobResult]:
+        job_results = await self._parse_one(
+            file_path,
+            extra_info,
+            fs=fs,
+            result_type=ResultType.JSON.value,
+            num_workers=num_workers,
+        )
+        return [
+            JobResult(
+                job_id=job_id,
+                file_name=file_name,
+                job_result=job_result,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                client=self.aclient,
+                page_separator=self.page_separator or _DEFAULT_SEPARATOR,
+            )
+            for job_id, job_result in job_results
+        ]
+
     async def aparse(
         self,
         file_path: Union[List[FileInput], FileInput],
@@ -1080,7 +1237,7 @@ class LlamaParse(BasePydanticReader):
             fs: Optional filesystem to use for reading files.
 
         Returns:
-            JobResult object or list of JobResult objects if multiple files were provided
+            JobResult object or list of JobResult objects if either multiple files were provided or file(s) were partitioned before parsing.
         """
 
         if isinstance(file_path, (str, PurePosixPath, Path, bytes, BufferedIOBase)):
@@ -1092,22 +1249,10 @@ class LlamaParse(BasePydanticReader):
                 file_name = extra_info["file_name"]
             else:
                 file_name = str(file_path)
-
-            job_id, job_result = await self._parse_one(
-                file_path,
-                extra_info=extra_info,
-                fs=fs,
-                result_type=ResultType.JSON.value,
+            result = await self._aparse_one(
+                file_path, file_name, extra_info=extra_info, fs=fs
             )
-            return JobResult(
-                job_id=job_id,
-                file_name=file_name,
-                job_result=job_result,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                client=self.aclient,
-                page_separator=self.page_separator or _DEFAULT_SEPARATOR,
-            )
+            return result[0] if len(result) == 1 else result
 
         elif isinstance(file_path, list):
             file_names = []
@@ -1121,35 +1266,25 @@ class LlamaParse(BasePydanticReader):
                 else:
                     file_names.append(str(f))
 
+            job_results = []
             try:
-                job_results = await run_jobs(
+                for result in await run_jobs(
                     [
-                        self._parse_one(
+                        self._aparse_one(
                             f,
+                            file_names[i],
                             extra_info=extra_info,
                             fs=fs,
-                            result_type=ResultType.JSON.value,
+                            num_workers=1,
                         )
-                        for f in file_path
+                        for i, f in enumerate(file_path)
                     ],
                     workers=self.num_workers,
                     desc="Getting job results",
                     show_progress=self.show_progress,
-                )
-
-                # Create JobResults just using the job_ids and job_results
-                return [
-                    JobResult(
-                        job_id=job_id,
-                        file_name=file_names[i],
-                        job_result=job_result,
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        client=self.aclient,
-                        page_separator=self.page_separator or _DEFAULT_SEPARATOR,
-                    )
-                    for i, (job_id, job_result) in enumerate(job_results)
-                ]
+                ):
+                    job_results.extend(result)
+                return job_results
 
             except RuntimeError as e:
                 if nest_asyncio_err in str(e):
@@ -1190,21 +1325,27 @@ class LlamaParse(BasePydanticReader):
                 raise e
 
     async def _aget_json(
-        self, file_path: FileInput, extra_info: Optional[dict] = None
+        self,
+        file_path: FileInput,
+        extra_info: Optional[dict] = None,
+        num_workers: Optional[int] = None,
     ) -> List[dict]:
         """Load data from the input path."""
         try:
-            job_id, result = await self._parse_one(
+            job_results = await self._parse_one(
                 file_path,
                 extra_info=extra_info,
                 result_type=ResultType.JSON.value,
+                num_workers=num_workers,
             )
-            result["job_id"] = job_id
 
-            if not isinstance(file_path, (bytes, BufferedIOBase)):
-                result["file_path"] = str(file_path)
-
-            return [result]
+            results = []
+            for job_id, job_result in job_results:
+                job_result["job_id"] = job_id
+                if not isinstance(file_path, (bytes, BufferedIOBase)):
+                    job_result["file_path"] = str(file_path)
+                results.append(job_result)
+            return results
         except Exception as e:
             file_repr = file_path if isinstance(file_path, str) else "<bytes/buffer>"
             print(f"Error while parsing the file '{file_repr}':", e)
