@@ -1066,27 +1066,20 @@ class LlamaParse(BasePydanticReader):
             try:
                 # Fetch JSON result type first to get accurate pagination data
                 # and then fetch the user's desired result type if needed
-                job_id, json_result = await self._parse_one_unpartitioned(
+                job_id, job_result = await self._parse_one_unpartitioned(
                     file_path,
                     extra_info=extra_info,
                     fs=fs,
                     result_type=ResultType.JSON.value,
                     partition_target_pages=f"{total}-{total + size - 1}",
                 )
-                result_type = result_type or self.result_type.value
-                if result_type == ResultType.JSON.value:
-                    job_result = json_result
-                else:
-                    job_result = await self._get_job_result(
-                        job_id, result_type, verbose=self.verbose
-                    )
             except Exception:
                 if results:
                     # API Error is expected if we try to read past the end of the file
                     return results
                 raise
             results.append((job_id, job_result))
-            if len(json_result["pages"]) < size:
+            if len(job_result["pages"]) < size:
                 break
             total += size
         return results
