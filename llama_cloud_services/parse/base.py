@@ -59,6 +59,36 @@ def build_url(
     return base_url
 
 
+class JobFailedException(Exception):
+    """Parse job failed exception."""
+
+    def __init__(
+        self,
+        job_id: str,
+        status: str,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ):
+        exception_str = (
+            f"Job ID: {job_id} failed with status: {status}, "
+            f'Error code: {error_code or "No error code found"}, '
+            f'Error message: {error_message or "No error message found"}'
+        )
+        super().__init__(exception_str)
+        self.job_id = job_id
+        self.status = status
+        self.error_code = error_code
+        self.error_message = error_message
+
+    @classmethod
+    def from_result(cls, result_json: Dict[str, Any]) -> "JobFailedException":
+        job_id = result_json["id"]
+        status = result_json["status"]
+        error_code = result_json.get("error_code")
+        error_message = result_json.get("error_message")
+        return cls(job_id, status, error_code=error_code, error_message=error_message)
+
+
 class BackoffPattern(str, Enum):
     """Backoff pattern for polling."""
 
@@ -938,15 +968,7 @@ class LlamaParse(BasePydanticReader):
                         print(".", end="", flush=True)
                     current_interval = self._calculate_backoff(current_interval)
                 else:
-                    error_code = result_json.get("error_code", "No error code found")
-                    error_message = result_json.get(
-                        "error_message", "No error message found"
-                    )
-                    exception_str = (
-                        f"Job ID: {job_id} failed with status: {status}, "
-                        f"Error code: {error_code}, Error message: {error_message}"
-                    )
-                    raise Exception(exception_str)
+                    raise JobFailedException.from_result(result_json)
             except (
                 httpx.ConnectError,
                 httpx.ReadError,
@@ -1073,9 +1095,9 @@ class LlamaParse(BasePydanticReader):
                     result_type=ResultType.JSON.value,
                     partition_target_pages=f"{total}-{total + size - 1}",
                 )
-            except Exception:
-                if results:
-                    # API Error is expected if we try to read past the end of the file
+            except JobFailedException as e:
+                if results and e.error_code == "NO_DATA_FOUND_IN_FILE":
+                    # Expected when we try to read past the end of the file
                     return results
                 raise
             results.append((job_id, job_result))
